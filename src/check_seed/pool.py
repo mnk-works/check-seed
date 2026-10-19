@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypeVar
 
-from .electrum import Connection, ElectrumError, Server, _utxo_value
+from .electrum import Connection, ElectrumError, Server, _utxo_parts, _utxo_value
 
 T = TypeVar("T")
 
@@ -85,28 +85,38 @@ class Pool:
                 continue
         raise ElectrumError(f"all servers failed ({retries + 1} attempts): {last}")
 
-    def poll(self, scripthash: str) -> tuple[int, str]:
-        """Sum unspent outputs for one scripthash. Returns (sats, server_key)."""
-        def work(conn: Connection) -> int:
-            return sum(_utxo_value(u) for u in conn.listunspent(scripthash))
+    def poll(self, scripthash: str) -> tuple[int, int, str]:
+        """Sum unspent outputs for one scripthash.
 
-        total, srv = self.with_connection(work)
-        return total, srv.key
+        Returns (confirmed_sats, unconfirmed_sats, server_key). height <= 0 marks
+        a mempool output.
+        """
+        def work(conn: Connection) -> tuple[int, int]:
+            confirmed = unconfirmed = 0
+            for u in conn.listunspent(scripthash):
+                value, height = _utxo_parts(u)
+                if height > 0:
+                    confirmed += value
+                else:
+                    unconfirmed += value
+            return confirmed, unconfirmed
 
-    def poll_all(self, scripthashes: list[str]) -> tuple[int, set[str]]:
+        (confirmed, unconfirmed), srv = self.with_connection(work)
+        return confirmed, unconfirmed, srv.key
+
+    def poll_all(self, scripthashes: list[str]) -> tuple[int, int, set[str]]:
         """Poll many scripthashes, spreading them across servers.
 
-        Returns (total_sats, set_of_server_keys_that_answered). Each scripthash
-        goes to a different server on a rotating basis, so no single server sees
-        the whole set.
+        Returns (confirmed, unconfirmed, server_keys_that_answered).
         """
-        total = 0
+        confirmed = unconfirmed = 0
         used: set[str] = set()
         for sh in scripthashes:
-            value, key = self.poll(sh)
-            total += value
+            c, u, key = self.poll(sh)
+            confirmed += c
+            unconfirmed += u
             used.add(key)
-        return total, used
+        return confirmed, unconfirmed, used
 
     def probe_all(self, timeout: float = 5.0) -> list[tuple[Server, bool, str]]:
         """Check which servers are reachable. Returns (server, ok, detail)."""

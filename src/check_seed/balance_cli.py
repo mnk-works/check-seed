@@ -8,7 +8,9 @@ any Bitcoin wallet does.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 from pathlib import Path
 
 from .btc import SCRIPT_TYPES, derive, fmt_btc, mask_address, scripthash_from_address
@@ -16,11 +18,13 @@ from .core import check_mnemonic, read_entries
 from .electrum import ElectrumError, Server, _utxo_value, load_servers
 from .pool import Pool
 
-BANNER = (
-    "NOTICE: seeds stay on this machine. Servers see only scripthashes (hashes of\n"
-    "        public keys) -- but they still learn your IP and which addresses you\n"
-    "        query. Use a distinct server per run, or route over Tor, if that matters.\n"
-)
+BANNER = """\
+NOTICE: seeds stay on this machine. Servers see only scripthashes (SHA256 of a
+        script, derived from public keys) -- but they still learn your IP and
+        which addresses you query. Use a distinct server per run, or route over
+        Tor, if that matters.
+        Network: {network}.
+"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,8 +33,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="Look up Bitcoin balances for seed phrases via public Electrum servers.",
         epilog="Balance figures come from the servers. Cross-check with --verify before acting.",
     )
-    p.add_argument("file", nargs="?", default="seeds.txt", help="file of phrases (default: seeds.txt)")
-    p.add_argument("-s", "--servers", default="servers.txt", help="server list (default: servers.txt)")
+    p.add_argument("file", nargs="?", default=None,
+                   help="file of phrases (default: seeds.txt, or testnet-seeds.txt with --testnet)")
+    p.add_argument("-s", "--servers", default=None,
+                   help="server list (default: servers.txt, or servers-testnet.txt with --testnet)")
+    p.add_argument(
+        "--testnet", action="store_true",
+        help="use Bitcoin testnet: testnet derivation, testnet server list",
+    )
+    p.add_argument(
+        "--success-file", default=None, metavar="PATH",
+        help="append phrases that have a balance to this file (default: success.txt)",
+    )
+    p.add_argument(
+        "--no-success-file", action="store_true",
+        help="do not record funded phrases",
+    )
     p.add_argument(
         "-t", "--script-type", default="all",
         help=f"one of {', '.join(SCRIPT_TYPES)} or 'all' (default: all)",
@@ -61,12 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def scan(pool: Pool, derived, gap: int) -> tuple[int, set[str], list, int]:
+def scan(pool: Pool, derived, gap: int) -> tuple[int, int, set[str], list, int]:
     """Poll addresses until `gap` consecutive unused ones are found.
 
-    Returns (total_sats, servers_used, funded_addresses, scanned_count).
+    Returns (confirmed, unconfirmed, servers_used, funded, scanned_count).
     """
-    total = 0
+    confirmed = unconfirmed = 0
     used: set[str] = set()
     funded: list = []
     misses = 0
@@ -74,7 +92,7 @@ def scan(pool: Pool, derived, gap: int) -> tuple[int, set[str], list, int]:
     for d in derived:
         scanned += 1
         try:
-            sats, key = pool.poll(d.scripthash)
+            c, u, key = pool.poll(d.scripthash)
         except ElectrumError as e:
             print(f"  ! {mask_address(d.address)}: {e}", file=sys.stderr)
             misses += 1
@@ -82,15 +100,16 @@ def scan(pool: Pool, derived, gap: int) -> tuple[int, set[str], list, int]:
                 break
             continue
         used.add(key)
-        if sats:
-            total += sats
-            funded.append((d, sats))
+        confirmed += c
+        unconfirmed += u
+        if c or u:
+            funded.append((d, c + u))
             misses = 0
         else:
             misses += 1
         if misses >= gap:
             break
-    return total, used, funded, scanned
+    return confirmed, unconfirmed, used, funded, scanned
 
 
 def verify_total(servers: list[Server], scripthashes: list[str], n: int, timeout: float) -> tuple[bool, list[str]]:
@@ -120,22 +139,23 @@ def check_addresses(pool: Pool, args) -> int:
     problems = 0
     for addr in args.address:
         try:
-            sh = scripthash_from_address(addr)
+            sh = scripthash_from_address(addr, args.network)
         except ValueError as e:
             print(f"{mask_address(addr)}: {e}", file=sys.stderr)
             problems += 1
             continue
         try:
-            total, key = pool.poll(sh)
+            conf, unconf, key = pool.poll(sh)
         except ElectrumError as e:
             print(f"{mask_address(addr)}: {e}", file=sys.stderr)
             problems += 1
             continue
 
-        label = "BALANCED" if total else "empty"
-        print(f"{mask_address(addr)}: {label}  {fmt_btc(total)}  [via {key}]")
+        label = "BALANCED" if (conf or unconf) else "empty"
+        extra = f" (+{fmt_btc(unconf)} unconfirmed)" if unconf else ""
+        print(f"{mask_address(addr)}: {label}  {fmt_btc(conf)}{extra}  [via {key}]")
 
-        if args.verify:
+        if args.verify and conf:
             agree, detail = verify_total(pool.servers, [sh], args.verify, args.timeout)
             print(f"      cross-check {args.verify} servers: {'agree' if agree else 'DISAGREE'}")
             for d in detail:
@@ -151,31 +171,61 @@ def check_addresses(pool: Pool, args) -> int:
     return 0
 
 
+def append_success(path: str, network: str, phrase: str, total_sats: int,
+                  lineno: int, servers: list[str]) -> None:
+    """Append a funded phrase to the success log. Never truncates.
+
+    The file holds real seed phrases, so it must stay out of version control -
+    .gitignore covers success.txt for that reason.
+    """
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(
+            f"# {stamp} {network} line {lineno} "
+            f"{fmt_btc(total_sats)} [{', '.join(servers)}]\n"
+            f"{phrase}\n"
+        )
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # best effort; not all filesystems support it
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    network = "testnet" if args.testnet else "mainnet"
+    args.network = network
 
     if not args.quiet_ok:
-        print(BANNER, file=sys.stderr)
+        print(BANNER.format(network=network), file=sys.stderr)
+
+    if args.file is None:
+        args.file = "testnet-seeds.txt" if args.testnet else "seeds.txt"
+    if args.servers is None:
+        args.servers = "servers-testnet.txt" if args.testnet else "servers.txt"
+    if args.success_file is None:
+        args.success_file = "success.txt"
 
     srv_path = Path(args.servers)
 
     if args.refresh_servers:
         from .servers import refresh, write_list
 
-        print("fetching canonical Electrum directory and probing endpoints...")
+        print(f"fetching canonical {network} Electrum directory and probing endpoints...")
         try:
-            live = refresh()
-        except OSError as e:
+            live = refresh(network=network)
+        except (OSError, ValueError) as e:
             print(f"error: could not fetch server list: {e}", file=sys.stderr)
             return 2
-        write_list(str(srv_path), live)
-        print(f"wrote {len(live)} live servers to {srv_path}")
+        write_list(str(srv_path), live, network=network)
+        print(f"wrote {len(live)} live {network} servers to {srv_path}")
         return 0
 
     if not srv_path.is_file():
         print(
-            f"error: no server list at {srv_path}\n"
-            f"       create one with: check-balances --refresh-servers",
+            f"error: no {network} server list at {srv_path}\n"
+            f"       create one with: check-balances --refresh-servers"
+            + (" --testnet" if args.testnet else ""),
             file=sys.stderr,
         )
         return 2
@@ -209,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: --script-type must be one of {SCRIPT_TYPES} or 'all'", file=sys.stderr)
         return 2
 
-    all_funded = False
+    funded_count = 0
     disagreements = 0
 
     for lineno, phrase in entries:
@@ -220,23 +270,28 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         total_all = 0
+        total_unconf = 0
         used_all: set[str] = set()
         rows: list[str] = []
         sh_list: list[str] = []
 
         for st in types:
-            derived = derive(phrase, st, count=args.count)
-            sub, used, funded, scanned = scan(pool, derived, args.gap)
-            total_all += sub
+            derived = derive(phrase, st, count=args.count, network=network)
+            conf, unconf, used, funded, scanned = scan(pool, derived, args.gap)
+            total_all += conf
+            total_unconf += unconf
             used_all |= used
             sh_list.extend(d.scripthash for d in derived)
+            note = f", {fmt_btc(unconf)} unconfirmed" if unconf else ""
             rows.append(
-                f"      {st:<12} {fmt_btc(sub):>18}   "
+                f"      {st:<12} {fmt_btc(conf):>18}{note:<28} "
                 f"({len(funded)} funded of {scanned} scanned)"
             )
 
-        header = "BALANCED" if total_all else "empty"
-        print(f"{label}: {header}  {fmt_btc(total_all)}  [{', '.join(sorted(used_all)) or 'no server'}]")
+        header = "BALANCED" if (total_all or total_unconf) else "empty"
+        extra = f" (+{fmt_btc(total_unconf)} unconfirmed)" if total_unconf else ""
+        print(f"{label}: {header}  {fmt_btc(total_all)}{extra}  "
+              f"[{', '.join(sorted(used_all)) or 'no server'}]")
         for r in rows:
             print(r)
 
@@ -249,9 +304,19 @@ def main(argv: list[str] | None = None) -> int:
             if not agree:
                 disagreements += 1
         elif args.verify:
-            print("      cross-check: skipped, balance is zero")
+            print("      cross-check: skipped, confirmed balance is zero")
 
-        all_funded |= total_all > 0
+        if total_all or total_unconf:
+            funded_count += 1
+            if not args.no_success_file:
+                append_success(
+                    args.success_file, network, phrase, total_all + total_unconf,
+                    lineno, sorted(used_all),
+                )
+                print(f"      appended to {args.success_file}")
+
+    if funded_count and not args.no_success_file:
+        print(f"\n{funded_count} funded phrase(s) appended to {args.success_file}")
 
     if args.stats:
         print("\nserver pool:\n" + pool.stats())

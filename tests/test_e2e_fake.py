@@ -50,16 +50,16 @@ def test_ping(honest):
 
 def test_pool_poll_returns_zero_for_empty(honest):
     pool = Pool([_srv(honest)], "round-robin")
-    total, key = pool.poll(SH)
-    assert total == 0
+    confirmed, unconfirmed, key = pool.poll(SH)
+    assert (confirmed, unconfirmed) == (0, 0)
     assert key == f"127.0.0.1:{honest.port}"
 
 
 def test_pool_poll_reads_lie_from_single_server(liar):
     """A lone liar will happily report a big balance - which is the whole risk."""
     pool = Pool([_srv(liar)], "round-robin")
-    total, _ = pool.poll(SH)
-    assert total == 50_000_000
+    confirmed, unconfirmed, _ = pool.poll(SH)
+    assert confirmed + unconfirmed == 50_000_000
 
 
 # --- the security property ------------------------------------------------

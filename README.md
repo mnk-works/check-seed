@@ -75,11 +75,16 @@ uv run check-balances --verify 3             # corroborate across 3 servers
 
 ```
 line 6: BALANCED  0.42130000 BTC  [electrum.emzy.de:50002, ...]
-      p2wpkh                0.42130000 BTC   (2 funded of 9 scanned)
-      p2sh-p2wpkh           0.00000000 BTC   (0 funded of 3 scanned)
-      p2pkh                 0.00000000 BTC   (0 funded of 3 scanned)
+      p2wpkh                0.42130000 BTC                      (2 funded of 9 scanned)
+      p2sh-p2wpkh           0.00000000 BTC                      (0 funded of 3 scanned)
+      p2pkh                 0.00000000 BTC                      (0 funded of 3 scanned)
       cross-check 3 servers: agree
+      appended to success.txt
 ```
+
+Balances are shown as **confirmed**, with any mempool amount called out
+separately (`(+0.00010000 BTC unconfirmed)`). A freshly-sent transaction still in
+the mempool is therefore visible immediately rather than looking empty.
 
 Addresses are derived for BIP84 (native segwit), BIP49 (P2SH-P2WPKH) and BIP44
 (legacy P2PKH) by default, each scanned until `--gap` consecutive unused
@@ -90,6 +95,44 @@ You can also query an address directly, with no seed involved:
 ```bash
 uv run check-balances -a bc1q... --verify 3
 ```
+
+### Testnet
+
+`--testnet` switches everything: derivation uses testnet coin type `1'`
+(`44'/1'`, `49'/1'`, `84'/1'`) and addresses encode as `tb1…` / `m…` / `2…`, the
+default seed file becomes `testnet-seeds.txt` and the server list
+`servers-testnet.txt`.
+
+```bash
+uv run check-balances --testnet --refresh-servers   # build testnet server list
+uv run check-balances --testnet                     # check testnet-seeds.txt
+uv run check-balances --testnet -a tb1q... --verify 3
+```
+
+Testnet addresses and mainnet addresses are mutually rejected: passing a `bc1…`
+address with `--testnet` fails loudly rather than silently querying the wrong
+chain. Note the derived *keys* genuinely differ between networks (different coin
+type), not just the address prefix — so a testnet address is not a re-encoded
+mainnet address.
+
+### The success log
+
+Any phrase with a non-zero balance (confirmed or unconfirmed) is appended to
+`success.txt` — appended, never truncated, so the file accumulates across runs.
+Each entry gets a timestamped comment line:
+
+```
+# 2026-10-19T12:34:56Z testnet line 3 0.00150000 BTC [blockstream.info:143]
+legal winner thank year wave sausage worth useful legal winner thank yellow
+```
+
+(The phrase shown is a public BIP39 test vector with no funds — not a real seed.)
+
+Use `--no-success-file` to disable, or `--success-file PATH` to redirect.
+
+> [!WARNING]
+> `success.txt` contains seed phrases. It is gitignored, written with mode
+> `0600`, and must never be committed or shared. Delete it once you are done.
 
 ### Load balancing
 
@@ -139,14 +182,17 @@ hostile server can still intercept traffic. Pinning is not implemented.
 | Flag | Effect |
 |---|---|
 | `-s`, `--servers` | Server list path (default `servers.txt`) |
+| `--testnet` | Use testnet derivation and `servers-testnet.txt` |
 | `-a`, `--address` | Check an address directly; repeatable |
 | `-t`, `--script-type` | `p2wpkh`, `p2sh-p2wpkh`, `p2pkh`, or `all` (default) |
 | `-n`, `--count` | Max addresses per script type (default 20) |
 | `-g`, `--gap` | Stop after N consecutive unused (default 6) |
 | `--strategy` | Load-balancing strategy (default `round-robin`) |
 | `--verify N` | Corroborate the total across N independent servers |
+| `--success-file` | Where to append funded phrases (default `success.txt`) |
+| `--no-success-file` | Do not record funded phrases |
 | `--probe` | Only test which servers are reachable |
-| `--refresh-servers` | Regenerate `servers.txt` from the canonical directory |
+| `--refresh-servers` | Regenerate the server list from the canonical directory |
 | `--stats` | Print per-server health after the run |
 
 ## `servers.txt` format
@@ -187,13 +233,13 @@ that offline.
 ## Development
 
 ```bash
-uv run pytest                                     # 47 tests, no network needed
+uv run pytest                                     # 60 tests, no network needed
 uv run check-seed seeds.example.txt               # public BIP39 test vectors
 ```
 
-Tests use only public BIP39/BIP44/49/84 test vectors and a local fake Electrum
-server bound to `127.0.0.1` — including one that lies about a balance, to prove
-cross-checking catches it.
+Tests use only public BIP39/BIP44/49/84 test vectors (mainnet *and* testnet) and a
+local fake Electrum server bound to `127.0.0.1` — including one that lies about a
+balance, to prove cross-checking catches it.
 
 ## License
 

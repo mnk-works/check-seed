@@ -63,28 +63,42 @@ def p2wsh_script(h160: bytes) -> bytes:
     return bytes.fromhex("0020") + h160
 
 
-def scripthash_from_address(addr: str) -> str:
+NETWORKS = ("mainnet", "testnet")
+
+# base58 version byte -> output script kind
+_P2PKH_VERSIONS = {0x00: "mainnet", 0x6F: "testnet"}
+_P2SH_VERSIONS = {0x05: "mainnet", 0xC4: "testnet"}
+
+
+def scripthash_from_address(addr: str, network: str = "mainnet") -> str:
     """Electrum scripthash for an address.
 
-    Rebuilds the output script the address pays to, then SHA256s it. Supports
-    P2PKH, P2SH, P2WPKH and P2WSH. Taproot (P2TR) is not indexed by Electrum
-    servers.
+    Rebuilds the output script the address pays to, then SHA256s it (reversed).
+    Supports P2PKH, P2SH, P2WPKH and P2WSH. Taproot (P2TR) is not indexed by
+    Electrum servers.
+
+    The output script itself is identical on mainnet and testnet - only the
+    address encoding differs - so `network` here is a guard against mixing them,
+    not a transformation.
     """
     from bech32 import bech32_decode, convertbits
     from base58 import b58decode_check
 
     low = addr.lower()
+    hrp_expected = "bc" if network == "mainnet" else "tb"
 
-    if low.startswith("bc1p"):
+    if low.startswith(f"{hrp_expected}1p"):
         raise ValueError(
             "taproot (P2TR) addresses are not indexed by Electrum servers"
         )
 
-    if low.startswith("bc1"):
+    if low.startswith("bc1") or low.startswith("tb1"):
         # bech32 lib returns (None, None) on failure, else (hrp, data)
         hrp, data = bech32_decode(addr)
-        if hrp != "bc" or not data:
-            raise ValueError(f"unrecognised bech32 address: {addr}")
+        if hrp != hrp_expected or not data:
+            raise ValueError(
+                f"address is not valid {network} (hrp={hrp!r}, expected {hrp_expected!r}): {addr}"
+            )
         witver = data[0]
         prog = convertbits(data[1:], 5, 8, False)
         if prog is None:
@@ -105,11 +119,20 @@ def scripthash_from_address(addr: str) -> str:
     if len(raw) != 21:
         raise ValueError(f"bad address payload: {addr}")
     version, payload = raw[0], raw[1:]
-    if version == 0x00:      # mainnet P2PKH
+
+    if version not in _P2PKH_VERSIONS and version not in _P2SH_VERSIONS:
+        raise ValueError(f"unsupported address version byte 0x{version:02x}")
+
+    found = _P2PKH_VERSIONS.get(version) or _P2SH_VERSIONS[version]
+    if found != network:
+        raise ValueError(
+            f"address belongs to {found}, but running against {network} "
+            f"(version byte 0x{version:02x})"
+        )
+
+    if version in _P2PKH_VERSIONS:
         return script_to_scripthash(p2pkh_script(payload))
-    if version in (0x05, 0xC4):  # mainnet / testnet P2SH
-        return script_to_scripthash(p2sh_script(payload))
-    raise ValueError(f"unsupported address version byte 0x{version:02x}")
+    return script_to_scripthash(p2sh_script(payload))
 
 
 @dataclass(frozen=True)
@@ -123,23 +146,35 @@ class Derived:
 
 
 def derive(seed_phrase: str, script_type: str = "p2wpkh", count: int = 20,
-           passphrase: str = "") -> list[Derived]:
+           passphrase: str = "", network: str = "mainnet") -> list[Derived]:
     """Derive `count` receive addresses from a seed, entirely locally.
 
-    BIP44 (p2pkh), BIP49 (p2sh-p2wpkh) and BIP84 (p2wpkh) are supported, all on
-    Bitcoin mainnet.
+    BIP44 (p2pkh), BIP49 (p2sh-p2wpkh) and BIP84 (p2wpkh) are supported on
+    Bitcoin mainnet or testnet.
+
+    Note the scripthash is network-independent: the output script is the same on
+    both chains, only the address encoding differs.
     """
     if script_type not in SCRIPT_TYPES:
         raise ValueError(f"script_type must be one of {SCRIPT_TYPES}")
+    if network not in NETWORKS:
+        raise ValueError(f"network must be one of {NETWORKS}")
 
     seed_bytes = Bip39SeedGenerator(seed_phrase).Generate(passphrase)
+    tn = network == "testnet"
 
     if script_type == "p2pkh":
-        acct = Bip44.FromSeed(seed_bytes, Bip44Coins.BITCOIN).Purpose().Coin().Account(0)
+        acct = Bip44.FromSeed(
+            seed_bytes, Bip44Coins.BITCOIN_TESTNET if tn else Bip44Coins.BITCOIN
+        ).Purpose().Coin().Account(0)
     elif script_type == "p2sh-p2wpkh":
-        acct = Bip49.FromSeed(seed_bytes, Bip49Coins.BITCOIN).Purpose().Coin().Account(0)
+        acct = Bip49.FromSeed(
+            seed_bytes, Bip49Coins.BITCOIN_TESTNET if tn else Bip49Coins.BITCOIN
+        ).Purpose().Coin().Account(0)
     else:
-        acct = Bip84.FromSeed(seed_bytes, Bip84Coins.BITCOIN).Purpose().Coin().Account(0)
+        acct = Bip84.FromSeed(
+            seed_bytes, Bip84Coins.BITCOIN_TESTNET if tn else Bip84Coins.BITCOIN
+        ).Purpose().Coin().Account(0)
 
     change = acct.Change(Bip44Changes.CHAIN_EXT)
 

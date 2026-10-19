@@ -25,23 +25,29 @@ class ElectrumError(Exception):
     pass
 
 
-def _utxo_value(u: object) -> int:
-    """Read the value from a listunspent entry.
+def _utxo_parts(u: object) -> tuple[int, int]:
+    """Return (value_sats, height) from a listunspent entry.
 
     Modern ElectrumX / Fulcrum / electrs return objects
     ``{"tx_hash", "tx_pos", "height", "value"}``; older servers returned the
     positional array ``[height, tx_pos, value]``. Both appear in the wild.
 
-    Strict on purpose: a malformed entry raises rather than defaulting to 0,
-    because a silent 0 would understate a balance.
+    height <= 0 means unconfirmed (mempool). Strict on purpose: a malformed entry
+    raises rather than defaulting to 0, because a silent 0 would understate a
+    balance.
     """
     if isinstance(u, dict):
         if "value" not in u:
             raise ElectrumError(f"listunspent entry has no 'value' field: {u!r}")
-        return int(u["value"])
+        return int(u["value"]), int(u.get("height", 0))
     if isinstance(u, (list, tuple)) and len(u) >= 3:
-        return int(u[2])
+        return int(u[2]), int(u[0])
     raise ElectrumError(f"unrecognised listunspent entry: {u!r}")
+
+
+def _utxo_value(u: object) -> int:
+    """Value only, regardless of confirmation state."""
+    return _utxo_parts(u)[0]
 
 
 @dataclass
