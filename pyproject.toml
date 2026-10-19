@@ -5,11 +5,15 @@ description = "Offline validator for BIP39 seed phrases, with redacted output by
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "base58>=2.1,<3",
+    "bech32>=1.2,<2",
+    "bip-utils>=2.9,<3",
     "mnemonic>=0.21,<0.22",
 ]
 
 [project.scripts]
 check-seed = "check_seed.cli:main"
+check-balances = "check_seed.balance_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.19,<0.13.0"]
