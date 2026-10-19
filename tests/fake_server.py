@@ -43,6 +43,7 @@ class FakeElectrum:
     def _handle(self, conn: socket.socket) -> None:
         conn.settimeout(3)
         buf = b""
+        state = {"version": False}
         try:
             while not self._stop.is_set():
                 chunk = conn.recv(4096)
@@ -57,20 +58,20 @@ class FakeElectrum:
                         req = json.loads(line.decode())
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         return
-                    if not self._respond(conn, req):
+                    if not self._respond(conn, req, state):
                         return
         except OSError:
             return
 
-    def _respond(self, conn: socket.socket, req: dict) -> bool:
+    def _respond(self, conn: socket.socket, req: dict, state: dict) -> bool:
         method = req.get("method")
         rid = req.get("id")
         params = req.get("params") or []
 
         if method == "server.version":
-            # Real ElectrumX/Fulcrum allow server.version exactly once per
-            # connection and reject a second with "server.version already done".
-            if self.version_calls:
+            # Real ElectrumX/Fulcrum allow server.version exactly once *per
+            # connection* and reject a second with "server.version already done".
+            if state["version"]:
                 payload = json.dumps({
                     "jsonrpc": "2.0", "id": rid,
                     "error": {"code": 1, "message": "server.version already done"},
@@ -80,6 +81,7 @@ class FakeElectrum:
                 except OSError:
                     return False
                 return True
+            state["version"] = True
             self.version_calls += 1
             result = ["FakeElectrum 0.1", "1.4"]
         elif method == "server.ping":

@@ -11,6 +11,7 @@ import argparse
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .btc import SCRIPT_TYPES, derive, fmt_btc, mask_address, scripthash_from_address
@@ -74,58 +75,120 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify", type=int, default=0, metavar="N",
         help="recompute each total from N independent servers and flag disagreement",
     )
+    p.add_argument(
+        "--workers", type=int, default=8, metavar="N",
+        help="concurrent server connections; each keeps one connection open (default: 8)",
+    )
     p.add_argument("--timeout", type=float, default=8.0, help="per-request timeout seconds")
     p.add_argument("--quiet-ok", action="store_true", help="suppress the notice banner")
     return p
 
 
-def scan(pool: Pool, derived, gap: int) -> tuple[int, int, set[str], list, int]:
-    """Poll addresses until `gap` consecutive unused ones are found.
+def scan_all(pool: Pool, derived_by_type: dict[str, list], gap: int,
+             workers: int = 8) -> dict[str, tuple[int, int, set[str], list, int]]:
+    """Scan several script types together, one pipelined batch per round.
 
-    Returns (confirmed, unconfirmed, servers_used, funded, scanned_count).
+    Querying all types in the same round matters: opening a fresh connection per
+    type tripled the handshake cost for no benefit. The window is at least `gap`
+    wide so the stop condition is unchanged, and at least `workers` wide so every
+    worker thread stays busy.
+
+    Returns {script_type: (confirmed, unconfirmed, servers_used, funded, scanned)}.
     """
-    confirmed = unconfirmed = 0
-    used: set[str] = set()
-    funded: list = []
-    misses = 0
-    scanned = 0
-    for d in derived:
-        scanned += 1
-        try:
-            c, u, key = pool.poll(d.scripthash)
-        except ElectrumError as e:
-            print(f"  ! {mask_address(d.address)}: {e}", file=sys.stderr)
-            misses += 1
-            if misses >= gap:
-                break
-            continue
-        used.add(key)
-        confirmed += c
-        unconfirmed += u
-        if c or u:
-            funded.append((d, c + u))
-            misses = 0
-        else:
-            misses += 1
-        if misses >= gap:
+    types = list(derived_by_type)
+    idx = {st: 0 for st in types}
+    conf = {st: 0 for st in types}
+    unconf = {st: 0 for st in types}
+    used = {st: set() for st in types}
+    funded = {st: [] for st in types}
+    scanned = {st: 0 for st in types}
+    misses = {st: 0 for st in types}
+
+    window = max(gap, workers, 1)
+    while True:
+        chunks: dict[str, list] = {}
+        batch: list[str] = []
+        for st in types:
+            if misses[st] >= gap:
+                continue
+            chunk = derived_by_type[st][idx[st]: idx[st] + window]
+            if not chunk:
+                continue
+            chunks[st] = chunk
+            batch.extend(d.scripthash for d in chunk)
+
+        if not batch:
             break
-    return confirmed, unconfirmed, used, funded, scanned
+
+        results = pool.poll_many(batch, workers)
+
+        for st, chunk in chunks.items():
+            start = idx[st]
+            stopped = False
+            for k, d in enumerate(chunk):
+                scanned[st] += 1
+                got = results.get(d.scripthash)
+                if got is None:
+                    # The batch could not be solved; retry this one on its own.
+                    try:
+                        got = pool.poll(d.scripthash)
+                    except ElectrumError as e:
+                        print(f"  ! {mask_address(d.address)}: {e}", file=sys.stderr)
+                        misses[st] += 1
+                        if misses[st] >= gap:
+                            idx[st] = start + k + 1
+                            stopped = True
+                            break
+                        continue
+
+                c, u, key = got
+                used[st].add(key)
+                conf[st] += c
+                unconf[st] += u
+                if c or u:
+                    funded[st].append((d, c + u))
+                    misses[st] = 0
+                else:
+                    misses[st] += 1
+                if misses[st] >= gap:
+                    idx[st] = start + k + 1
+                    stopped = True
+                    break
+            if not stopped:
+                idx[st] = start + len(chunk)
+
+    return {
+        st: (conf[st], unconf[st], used[st], funded[st], scanned[st])
+        for st in types
+    }
 
 
-def verify_total(servers: list[Server], scripthashes: list[str], n: int, timeout: float) -> tuple[bool, list[str]]:
-    """Recompute a total from up to n distinct servers and compare."""
+def verify_total(servers: list[Server], scripthashes: list[str], n: int,
+                 timeout: float, workers: int = 8) -> tuple[bool, list[str]]:
+    """Recompute a total from up to n distinct servers, in parallel, and compare."""
     from .electrum import Connection
 
-    results: dict[str, int] = {}
-    for srv in servers[:n]:
+    live = [s for s in servers if s.healthy] or list(servers)
+    chosen = live[:n]
+
+    def one(srv: Server) -> tuple[str, int] | None:
         try:
             with Connection(srv, timeout=timeout) as conn:
-                results[srv.key] = sum(
-                    sum(_utxo_value(u) for u in conn.listunspent(sh))
+                return srv.key, sum(
+                    _utxo_value(u)
                     for sh in scripthashes
+                    for u in conn.listunspent(sh)
                 )
         except (ElectrumError, OSError):
-            continue
+            return None
+
+    results: dict[str, int] = {}
+    if chosen:
+        with ThreadPoolExecutor(max_workers=min(len(chosen), max(workers, 1))) as ex:
+            for row in ex.map(one, chosen):
+                if row is not None:
+                    results[row[0]] = row[1]
+
     if len(results) < 2:
         return True, ["verify skipped: fewer than 2 servers answered"]
     distinct = set(results.values())
@@ -137,26 +200,33 @@ def verify_total(servers: list[Server], scripthashes: list[str], n: int, timeout
 def check_addresses(pool: Pool, args) -> int:
     """Query explicit addresses, bypassing seed derivation entirely."""
     problems = 0
+    resolved: list[tuple[str, str]] = []
     for addr in args.address:
         try:
-            sh = scripthash_from_address(addr, args.network)
+            resolved.append((addr, scripthash_from_address(addr, args.network)))
         except ValueError as e:
             print(f"{mask_address(addr)}: {e}", file=sys.stderr)
             problems += 1
-            continue
-        try:
-            conf, unconf, key = pool.poll(sh)
-        except ElectrumError as e:
-            print(f"{mask_address(addr)}: {e}", file=sys.stderr)
-            problems += 1
-            continue
+
+    results = pool.poll_many([sh for _, sh in resolved], args.workers) if resolved else {}
+
+    for addr, sh in resolved:
+        got = results.get(sh)
+        if got is None:
+            try:
+                got = pool.poll(sh)
+            except ElectrumError as e:
+                print(f"{mask_address(addr)}: {e}", file=sys.stderr)
+                problems += 1
+                continue
+        conf, unconf, key = got
 
         label = "BALANCED" if (conf or unconf) else "empty"
         extra = f" (+{fmt_btc(unconf)} unconfirmed)" if unconf else ""
         print(f"{mask_address(addr)}: {label}  {fmt_btc(conf)}{extra}  [via {key}]")
 
-        if args.verify and conf:
-            agree, detail = verify_total(pool.servers, [sh], args.verify, args.timeout)
+        if args.verify and (conf or unconf):
+            agree, detail = verify_total(pool.servers, [sh], args.verify, args.timeout, args.workers)
             print(f"      cross-check {args.verify} servers: {'agree' if agree else 'DISAGREE'}")
             for d in detail:
                 print(f"        {d}")
@@ -210,6 +280,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     network = "testnet" if args.testnet else "mainnet"
     args.network = network
+
+    if args.gap < 1:
+        print("error: --gap must be at least 1", file=sys.stderr)
+        return 2
+    if args.workers < 1:
+        print("error: --workers must be at least 1", file=sys.stderr)
+        return 2
 
     if not args.quiet_ok:
         print(BANNER.format(network=network), file=sys.stderr)
@@ -291,13 +368,18 @@ def main(argv: list[str] | None = None) -> int:
         rows: list[str] = []
         sh_list: list[str] = []
 
+        derived_by_type = {
+            st: derive(phrase, st, count=args.count, network=network) for st in types
+        }
+        scans = scan_all(pool, derived_by_type, args.gap, args.workers)
+
         for st in types:
-            derived = derive(phrase, st, count=args.count, network=network)
-            conf, unconf, used, funded, scanned = scan(pool, derived, args.gap)
+            conf, unconf, used, funded, scanned = scans[st]
             total_all += conf
             total_unconf += unconf
             used_all |= used
-            sh_list.extend(d.scripthash for d in derived)
+            # Only the addresses actually scanned matter to the cross-check.
+            sh_list.extend(d.scripthash for d in derived_by_type[st][:scanned])
             note = f", {fmt_btc(unconf)} unconfirmed" if unconf else ""
             rows.append(
                 f"      {st:<12} {fmt_btc(conf):>18}{note:<32} "
@@ -312,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
             print(r)
 
         if args.verify and (total_all or total_unconf):
-            agree, detail = verify_total(pool.servers, sh_list, args.verify, args.timeout)
+            agree, detail = verify_total(pool.servers, sh_list, args.verify, args.timeout, args.workers)
             flag = "agree" if agree else "DISAGREE"
             print(f"      cross-check {args.verify} servers: {flag} (includes unconfirmed)")
             for d in detail:

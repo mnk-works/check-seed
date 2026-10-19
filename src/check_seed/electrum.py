@@ -139,6 +139,57 @@ class Connection:
             pass
         self._fh = self._sock = None
 
+    def call_many(self, method: str, params_list: list[list]) -> list:
+        """Send several requests on one connection, then read the replies.
+
+        The Electrum protocol is line-delimited JSON-RPC over a persistent stream,
+        so requests can be pipelined: write them all, then read them all. One
+        round-trip instead of N is the difference between a scan feeling instant
+        and feeling broken on a high-latency link.
+
+        Replies are returned in the same order as the requests. An error on any
+        request raises, so the caller can retry the whole batch elsewhere.
+        """
+        if self._fh is None:
+            raise ElectrumError("not connected")
+
+        ids: list[int] = []
+        for params in params_list:
+            self._next_id += 1
+            ids.append(self._next_id)
+            msg = {"id": self._next_id, "method": method, "params": params}
+            try:
+                self._fh.write((json.dumps(msg) + "\n").encode())
+            except OSError as e:
+                raise ElectrumError(f"write failed: {e}") from e
+        try:
+            self._fh.flush()
+        except OSError as e:
+            raise ElectrumError(f"write failed: {e}") from e
+
+        pending = set(ids)
+        got: dict[int, object] = {}
+        while pending:
+            line = self._fh.readline()
+            if not line:
+                raise ElectrumError("connection closed by server")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                resp = json.loads(line.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise ElectrumError(f"bad response: {e}") from e
+            if not isinstance(resp, dict) or resp.get("id") not in pending:
+                continue  # unsolicited notice
+            rid = resp["id"]
+            if "error" in resp:
+                raise ElectrumError(f"{method}: {resp['error']}")
+            got[rid] = resp.get("result")
+            pending.discard(rid)
+
+        return [got[i] for i in ids]
+
     def call(self, method: str, params: list | None = None) -> object:
         if self._fh is None:
             raise ElectrumError("not connected")
@@ -176,6 +227,13 @@ class Connection:
     def listunspent(self, scripthash: str) -> list:
         """Unspent outputs as [height, tx_pos, value_sats]."""
         return self.call("blockchain.scripthash.listunspent", [scripthash]) or []
+
+    def listunspent_many(self, scripthashes: list[str]) -> list[list]:
+        """Pipelined listunspent for several scripthashes. Order is preserved."""
+        replies = self.call_many(
+            "blockchain.scripthash.listunspent", [[sh] for sh in scripthashes]
+        )
+        return [r or [] for r in replies]
 
     def get_history(self, scripthash: str) -> list:
         """Txids touching the script as [[txid, height], ...]."""

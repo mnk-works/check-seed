@@ -149,6 +149,24 @@ Servers that fail get an exponential cooldown (5s doubling, capped at 5 min) and
 are skipped while unhealthy. `uv run check-balances --probe` shows liveness, and
 `--stats` prints per-server health after a run.
 
+### Speed
+
+Addresses are queried concurrently over **pipelined, keep-alive connections**:
+
+- one TCP+TLS connection per worker, reused for that worker's whole shard, instead
+  of a fresh handshake per address;
+- all requests for a shard written at once, then all replies read — one round-trip
+  instead of one per address;
+- all three script types queried in the same round, rather than three separate
+  sequential passes;
+- `--verify N` asks its N servers in parallel.
+
+`--workers N` (default 8) sets how many connections are opened. One representative
+testnet scan went from ~50s to ~5s without changing which addresses were checked.
+Past `--workers 8` the returns are small and you start hitting the slowest server
+in the pool; `--workers 2`–`4` is often just as quick because it avoids them
+entirely.
+
 ### Trusting the numbers
 
 **The balance comes from the server, not from your node.** A hostile or broken
@@ -188,6 +206,7 @@ hostile server can still intercept traffic. Pinning is not implemented.
 | `-n`, `--count` | Max addresses per script type (default 20) |
 | `-g`, `--gap` | Stop after N consecutive unused (default 6) |
 | `--strategy` | Load-balancing strategy (default `round-robin`) |
+| `--workers N` | Concurrent connections (default 8) |
 | `--verify N` | Corroborate the total across N independent servers |
 | `--success-file` | Where to append funded phrases (default `success.txt`) |
 | `--no-success-file` | Do not record funded phrases |
@@ -233,7 +252,7 @@ that offline.
 ## Development
 
 ```bash
-uv run pytest                                     # 60 tests, no network needed
+uv run pytest                                     # 69 tests, no network needed
 uv run check-seed seeds.example.txt               # public BIP39 test vectors
 ```
 
