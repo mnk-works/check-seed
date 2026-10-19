@@ -171,13 +171,27 @@ def check_addresses(pool: Pool, args) -> int:
     return 0
 
 
+def phrase_already_logged(path: str, phrase: str) -> bool:
+    """True if this exact phrase already appears in the success log."""
+    p = Path(path)
+    if not p.is_file():
+        return False
+    return phrase in p.read_text(encoding="utf-8").splitlines()
+
+
 def append_success(path: str, network: str, phrase: str, total_sats: int,
-                  lineno: int, servers: list[str]) -> None:
+                  lineno: int, servers: list[str]) -> bool:
     """Append a funded phrase to the success log. Never truncates.
+
+    Returns False if the phrase is already present, so repeated runs do not pile
+    up duplicate entries.
 
     The file holds real seed phrases, so it must stay out of version control -
     .gitignore covers success.txt for that reason.
     """
+    if phrase_already_logged(path, phrase):
+        return False
+
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(
@@ -189,6 +203,7 @@ def append_success(path: str, network: str, phrase: str, total_sats: int,
         os.chmod(path, 0o600)
     except OSError:
         pass  # best effort; not all filesystems support it
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -260,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     funded_count = 0
+    added_count = 0
     disagreements = 0
 
     for lineno, phrase in entries:
@@ -284,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             sh_list.extend(d.scripthash for d in derived)
             note = f", {fmt_btc(unconf)} unconfirmed" if unconf else ""
             rows.append(
-                f"      {st:<12} {fmt_btc(conf):>18}{note:<28} "
+                f"      {st:<12} {fmt_btc(conf):>18}{note:<32} "
                 f"({len(funded)} funded of {scanned} scanned)"
             )
 
@@ -295,28 +311,37 @@ def main(argv: list[str] | None = None) -> int:
         for r in rows:
             print(r)
 
-        if args.verify and total_all:
+        if args.verify and (total_all or total_unconf):
             agree, detail = verify_total(pool.servers, sh_list, args.verify, args.timeout)
             flag = "agree" if agree else "DISAGREE"
-            print(f"      cross-check {args.verify} servers: {flag}")
+            print(f"      cross-check {args.verify} servers: {flag} (includes unconfirmed)")
             for d in detail:
                 print(f"        {d}")
             if not agree:
                 disagreements += 1
         elif args.verify:
-            print("      cross-check: skipped, confirmed balance is zero")
+            print("      cross-check: skipped, balance is zero")
 
         if total_all or total_unconf:
             funded_count += 1
             if not args.no_success_file:
-                append_success(
+                added = append_success(
                     args.success_file, network, phrase, total_all + total_unconf,
                     lineno, sorted(used_all),
                 )
-                print(f"      appended to {args.success_file}")
+                if added:
+                    added_count += 1
+                    print(f"      appended to {args.success_file}")
+                else:
+                    print(f"      already in {args.success_file}, not duplicated")
 
     if funded_count and not args.no_success_file:
-        print(f"\n{funded_count} funded phrase(s) appended to {args.success_file}")
+        skipped = funded_count - added_count
+        msg = f"\n{funded_count} funded phrase(s)"
+        msg += f", {added_count} newly appended to {args.success_file}"
+        if skipped:
+            msg += f" ({skipped} already present)"
+        print(msg)
 
     if args.stats:
         print("\nserver pool:\n" + pool.stats())

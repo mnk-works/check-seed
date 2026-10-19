@@ -18,7 +18,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="check-seed",
         description="Validate BIP39 seed phrases from a file, one per line.",
-        epilog="Never commit seeds.txt. Never paste output of --show-seeds anywhere.",
+        epilog=(
+            "This command is offline only: it validates the checksum and wordlist, "
+            "and never touches the network.\n"
+            "To look up balances (mainnet or --testnet), use: check-balances"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
         "file",

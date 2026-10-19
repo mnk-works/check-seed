@@ -108,3 +108,20 @@ def test_append_success_permissions(tmp_path):
     append_success(str(path), "testnet", ABANDON, 1, 1, [])
     mode = stat.S_IMODE(os.stat(path).st_mode)
     assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+
+def test_append_success_deduplicates(tmp_path):
+    """Re-running against the same funded phrase must not pile up entries."""
+    path = tmp_path / "success.txt"
+    assert append_success(str(path), "testnet", ABANDON, 1000, 3, []) is True
+    assert append_success(str(path), "testnet", ABANDON, 1000, 3, []) is False
+    assert path.read_text().count(ABANDON) == 1
+    # but a different phrase is still appended
+    assert append_success(str(path), "testnet", OTHER, 2000, 4, []) is True
+    assert path.read_text().count(OTHER) == 1
+
+
+def test_phrase_already_logged_handles_missing_file(tmp_path):
+    from check_seed.balance_cli import phrase_already_logged
+
+    assert phrase_already_logged(str(tmp_path / "nope.txt"), ABANDON) is False
