@@ -1,0 +1,32 @@
+# Example phrases - PUBLIC BIP39 TEST VECTORS, no real funds.
+# Copy to seeds.txt and edit. Never commit seeds.txt.
+# Format: one phrase per line. Blank lines and '#' comments are ignored.
+
+# --- valid: 12-word (128-bit entropy) ---
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+legal winner thank year wave sausage worth useful legal winner thank yellow
+letter advice cage absurd amount doctor acoustic avoid letter advice cage above
+
+# --- valid: 15-word (160-bit entropy) ---
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon address
+
+# --- valid: 18-word (192-bit entropy) ---
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon agent
+
+# --- valid: 21-word (224-bit entropy) ---
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon admit
+
+# --- valid: 24-word (256-bit entropy) ---
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art
+
+# --- invalid: 11 words (not a legal length) ---
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon
+
+# --- invalid: word not on the BIP39 list ---
+abandon abandon zzzzzzzz abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+
+# --- invalid: checksum (words in wrong order) ---
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about abandon
+
+# --- invalid: single typo ---
+legal winner thank year wave sausage worth useful legal winner thank zzzzy

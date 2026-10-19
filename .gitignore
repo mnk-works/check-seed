@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# NEVER commit seed phrases - these are wallet private keys.
+# Use seeds.example.txt as a template and keep real seeds local only.
+seeds.txt
+seeds*.txt
+!seeds.example.txt
+*.mnemonic
+*.seed
+*.key
